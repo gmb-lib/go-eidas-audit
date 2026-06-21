@@ -1,42 +1,149 @@
 package eidas
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"strings"
+	"sync"
+	"time"
 
 	"azugo.io/azugo"
+	"go.uber.org/zap"
 
 	"github.com/gmb-lib/go-platform-kit/broker"
+	"github.com/gmb-lib/go-platform-kit/observability"
 )
 
 // DefaultTopic is the broker topic the audit/evidence sink consumes eIDAS-audit
 // signing-evidence events from.
 const DefaultTopic = "audit.signing"
 
-// Emitter publishes eIDAS-audit signing-evidence events. Construct one per service
-// over the service's broker.Publisher; it is safe for concurrent use (it holds
-// no mutable state beyond the publisher, which is itself concurrency-safe).
+// Default resilience knobs for the background drainer, used when Options leaves
+// them unset.
+const (
+	DefaultMaxRetries   = 5
+	DefaultRetryBackoff = 500 * time.Millisecond
+)
+
+// maxBackoff caps the drainer's exponential backoff.
+const maxBackoff = 30 * time.Second
+
+// MetricEmitTotal counts signing-evidence events by emission-lifecycle outcome.
+// Alert on the dropped outcome — it means legal evidence was lost.
+const MetricEmitTotal = "eidas_audit_emit_total"
+
+// Emission-lifecycle metric label values.
+const (
+	outcomePublished = "published" // delivered to the broker (sync, enqueue-fallback, or drained)
+	outcomeBuffered  = "buffered"  // written to the durable outbox for background delivery
+	outcomeDropped   = "dropped"   // not delivered and not buffered (dead-lettered when configured)
+)
+
+// DeadLetterFunc receives an event the Emitter is about to drop (outbox full and
+// the synchronous fallback failed, drain retries exhausted, or a flush failure)
+// so the service can persist it out-of-band instead of losing legal evidence. It
+// must not block for long and must not panic.
+type DeadLetterFunc func(rec *broker.Envelope)
+
+// Emitter publishes eIDAS-audit signing-evidence events. Construct one per
+// service with New (or NewEmitter for the legacy synchronous mode). With a
+// durable Outbox it emits non-blocking + durable: Emit stamps and spools the
+// event and returns, while Drain publishes it to the broker in the background
+// and Close flushes on shutdown. It is safe for concurrent use.
 type Emitter struct {
 	pub   *broker.Publisher
 	topic string
+
+	// Durable-outbox emission. A nil outbox selects the legacy synchronous
+	// publish (Emit publishes inline; Drain/Flush/Close are no-ops).
+	outbox       Outbox
+	log          *zap.Logger
+	deadLetter   DeadLetterFunc
+	maxRetries   int
+	retryBackoff time.Duration
+
+	// Drain lifecycle (owned by Drain / Close).
+	lcMu      sync.Mutex
+	draining  bool
+	drainStop context.CancelFunc
+	drainDone chan struct{}
 }
 
-// NewEmitter returns an Emitter that publishes to topic over pub. Pass
-// DefaultTopic unless the deployment overrides it. pub is the service's
-// broker.Publisher (broker.NewPublisher with the injected transport).
+// Options configures durable, non-blocking emission for New.
+type Options struct {
+	// Outbox makes emission durable + non-blocking: Emit spools the event and
+	// returns, and a background Drain publishes it. The shipped FileOutbox is
+	// crash-safe; the default (nil here) is the legacy synchronous publish, which
+	// is NOT durable. Production signing services should supply a FileOutbox.
+	Outbox Outbox
+	// Logger is used for drop/lifecycle warnings. Defaults to a no-op logger.
+	Logger *zap.Logger
+	// DeadLetter, when set, receives every event the Emitter would otherwise drop
+	// so it can be persisted out-of-band. Strongly recommended for evidence.
+	DeadLetter DeadLetterFunc
+	// MaxRetries bounds the drainer's per-event retry attempts. 0 selects
+	// DefaultMaxRetries (evidence should retry); there is no "zero retries" mode.
+	MaxRetries int
+	// RetryBackoff is the initial drain backoff; it doubles up to an internal cap
+	// with jitter. 0 selects DefaultRetryBackoff.
+	RetryBackoff time.Duration
+}
+
+// NewEmitter returns a legacy synchronous Emitter that publishes to topic over
+// pub (no outbox — events are NOT durable). Pass DefaultTopic unless the
+// deployment overrides it. Prefer New with a durable Outbox for production.
 func NewEmitter(pub *broker.Publisher, topic string) *Emitter {
+	return New(pub, topic, Options{})
+}
+
+// New returns an Emitter publishing to topic over pub. With opts.Outbox set it
+// emits non-blocking + durable (run Drain in a background goroutine and call
+// Close on shutdown); without it, emission is synchronous and non-durable.
+func New(pub *broker.Publisher, topic string, opts Options) *Emitter {
 	if topic == "" {
 		topic = DefaultTopic
 	}
 
-	return &Emitter{pub: pub, topic: topic}
+	log := opts.Logger
+	if log == nil {
+		log = zap.NewNop()
+	}
+
+	maxRetries := opts.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = DefaultMaxRetries
+	}
+
+	retryBackoff := opts.RetryBackoff
+	if retryBackoff <= 0 {
+		retryBackoff = DefaultRetryBackoff
+	}
+
+	if opts.Outbox == nil {
+		log.Warn("eidas-audit: no outbox configured — signing-evidence events publish synchronously and are NOT durable; supply a durable Outbox (e.g. FileOutbox via EIDAS_AUDIT_OUTBOX_DIR) for production")
+	}
+
+	return &Emitter{
+		pub:          pub,
+		topic:        topic,
+		outbox:       opts.Outbox,
+		log:          log,
+		deadLetter:   opts.DeadLetter,
+		maxRetries:   maxRetries,
+		retryBackoff: retryBackoff,
+	}
 }
 
 // Emit is the escape hatch for events not covered by a typed helper. It tags the
 // envelope as a signing event when no category is set, strips fat/PII attribute
-// keys, and publishes (broker.Publish stamps the event id, occurrence time, and
-// correlation, then validates). Prefer the typed helpers — they fix the
-// event_type and attribute shape so the chain stays consistent.
+// keys, then stamps the event id / occurrence time / correlation from ctx and
+// validates. With a durable Outbox it spools the (now frozen) event and returns
+// without touching the broker — so the request path never blocks on NATS and the
+// event survives a crash; the background Drain publishes it. Without an outbox it
+// publishes synchronously. Prefer the typed helpers — they fix the event_type and
+// attribute shape so the chain stays consistent.
 func (e *Emitter) Emit(ctx *azugo.Context, ev *broker.Envelope) error {
 	if e == nil || e.pub == nil {
 		return errors.New("eidas: emitter has no publisher")
@@ -52,7 +159,50 @@ func (e *Emitter) Emit(ctx *azugo.Context, ev *broker.Envelope) error {
 
 	ev.Attributes = sanitize(ev.Attributes)
 
-	return e.pub.Publish(ctx, e.topic, ev)
+	// Freeze identity + correlation NOW, on the request path, so a deferred
+	// (drained) publish preserves the originating request's occurred_at and
+	// trace ids rather than the drain's.
+	broker.Stamp(ctx, ev)
+
+	if err := ev.Validate(); err != nil {
+		return err
+	}
+
+	// No outbox: legacy synchronous publish.
+	if e.outbox == nil {
+		return e.publish(ctx, ev)
+	}
+
+	// Durable-first: spool locally and return immediately; the drainer publishes.
+	if err := e.outbox.Enqueue(ev); err != nil {
+		// The spool is full or the disk is failing. Do NOT silently drop legal
+		// evidence: attempt a synchronous publish (the event is already stamped
+		// and validated). Only if that also fails do we dead-letter.
+		if pErr := e.publish(ctx, ev); pErr != nil {
+			cause := errors.Join(err, pErr)
+			e.drop(ev, "enqueue failed and synchronous publish failed", cause)
+
+			return fmt.Errorf("eidas: evidence not buffered and not published: %w", cause)
+		}
+
+		return nil
+	}
+
+	incEmit(outcomeBuffered)
+
+	return nil
+}
+
+// publish delivers an already-stamped event over the broker and records the
+// published outcome on success. ctx may be the request *azugo.Context (which
+// satisfies context.Context) or a plain background context from the drainer.
+func (e *Emitter) publish(ctx context.Context, ev *broker.Envelope) error {
+	err := e.pub.PublishStamped(ctx, e.topic, ev)
+	if err == nil {
+		incEmit(outcomePublished)
+	}
+
+	return err
 }
 
 // signing builds a eIDAS-audit envelope skeleton with the given event type,
@@ -503,4 +653,173 @@ func compact(attrs map[string]any) map[string]any {
 	}
 
 	return attrs
+}
+
+// Drain publishes buffered events until ctx is cancelled. Run it once in a
+// background goroutine with an application-lifetime context (go e.Drain(appCtx)),
+// never a per-request context; prefer stopping it via Close, which also flushes.
+// Each event is retried with jittered exponential backoff up to MaxRetries; an
+// event that still cannot be published is dead-lettered (when a DeadLetter sink
+// is configured) and dropped with a warning. A second concurrent Drain call is
+// ignored. It is a no-op when the Emitter has no outbox (synchronous mode).
+func (e *Emitter) Drain(ctx context.Context) {
+	if e == nil || e.outbox == nil {
+		return
+	}
+
+	e.lcMu.Lock()
+	if e.draining {
+		e.lcMu.Unlock()
+		e.log.Warn("eidas-audit: Drain already running; ignoring duplicate call")
+
+		return
+	}
+
+	dctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	e.draining = true
+	e.drainStop = cancel
+	e.drainDone = done
+	e.lcMu.Unlock()
+
+	defer func() {
+		cancel()
+
+		e.lcMu.Lock()
+		e.draining = false
+		e.drainStop = nil
+		e.drainDone = nil
+		e.lcMu.Unlock()
+
+		close(done)
+	}()
+
+	for {
+		rec, err := e.outbox.Dequeue(dctx)
+		if err != nil {
+			return
+		}
+
+		e.deliver(dctx, rec)
+	}
+}
+
+// deliver retries a single buffered event with capped, jittered exponential
+// backoff. If ctx is cancelled mid-retry the event is re-buffered so a
+// subsequent Flush/Close can still publish it.
+func (e *Emitter) deliver(ctx context.Context, rec *broker.Envelope) {
+	backoff := e.retryBackoff
+
+	for attempt := 0; ; attempt++ {
+		if err := e.publish(ctx, rec); err == nil {
+			return
+		}
+
+		if attempt >= e.maxRetries {
+			e.drop(rec, "drain retries exhausted", nil)
+
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			if err := e.outbox.Enqueue(rec); err != nil {
+				e.drop(rec, "drain cancelled and outbox full", err)
+			}
+
+			return
+		case <-time.After(jitter(backoff)):
+		}
+
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+}
+
+// jitter spreads a backoff delay over [d/2, d] so recovering brokers are not hit
+// by a thundering herd of synchronized retries.
+func jitter(d time.Duration) time.Duration {
+	if d <= 1 {
+		return d
+	}
+
+	half := d / 2
+
+	return half + rand.N(half+1)
+}
+
+// Flush synchronously publishes every currently-buffered event, best-effort, for
+// graceful shutdown. Prefer Close, which stops the drainer first so the two do
+// not both consume the Outbox. It is a no-op when the Emitter has no outbox.
+func (e *Emitter) Flush(ctx context.Context) error {
+	if e == nil || e.outbox == nil {
+		return nil
+	}
+
+	for e.outbox.Len() > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		rec, err := e.outbox.Dequeue(ctx)
+		if err != nil {
+			return err
+		}
+
+		if err := e.publish(ctx, rec); err != nil {
+			e.drop(rec, "flush failed", err)
+		}
+	}
+
+	return nil
+}
+
+// Close stops the background drainer (if running), waits for it to exit, then
+// flushes the outbox — the single shutdown call. It is bounded by ctx and is a
+// no-op when the Emitter has no outbox.
+func (e *Emitter) Close(ctx context.Context) error {
+	if e == nil || e.outbox == nil {
+		return nil
+	}
+
+	e.lcMu.Lock()
+	stop, done := e.drainStop, e.drainDone
+	e.lcMu.Unlock()
+
+	if stop != nil {
+		stop()
+
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	return e.Flush(ctx)
+}
+
+// drop counts, logs and (when configured) dead-letters an event that could not
+// be published or buffered.
+func (e *Emitter) drop(rec *broker.Envelope, reason string, err error) {
+	incEmit(outcomeDropped)
+	e.log.Warn("eidas-audit: dropping signing-evidence event",
+		zap.String("reason", reason),
+		zap.String("event_id", rec.EventID),
+		zap.String("event_type", rec.EventType),
+		zap.Error(err),
+	)
+
+	if e.deadLetter != nil {
+		e.deadLetter(rec)
+	}
+}
+
+func incEmit(outcome string) {
+	observability.IncCounter(MetricEmitTotal, map[string]string{
+		observability.LabelOutcome: outcome,
+	})
 }

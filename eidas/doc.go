@@ -5,11 +5,27 @@
 // regardless of which service produced the event.
 //
 // It is a thin layer over go-platform-kit's broker: every event is the frozen
-// broker.Envelope, tagged broker.CategorySigning, stamped with a ULID event
-// id, a high-precision occurrence time, and the request's correlation/trace ids
-// (broker.Publish handles stamping + validation), then published to the signing
-// topic over the broker's TLS + per-topic ACLs. Async is fine here — integrity,
-// not latency, is the priority.
+// broker.Envelope, tagged broker.CategorySigning, stamped with a ULID event id,
+// a high-precision occurrence time, and the request's correlation/trace ids (Emit
+// stamps + validates on the request path), then published to the signing topic
+// over the broker's TLS + per-topic ACLs.
+//
+// # Durable, non-blocking emission
+//
+// Integrity, not latency, is the priority — these events are the hash-chained
+// legal record of a signing. Construct the Emitter with a durable Outbox (see
+// Options / New) and emission becomes non-blocking AND durable: Emit freezes the
+// event (stamp + validate) and writes it to the local spool, so the request path
+// never blocks on the broker and the event survives a crash/redeploy; a
+// background Drain publishes it (jittered retry) and Close flushes on shutdown.
+// If a spool write fails (full / disk error) Emit falls back to a synchronous
+// publish rather than silently dropping evidence. Without an Outbox (NewEmitter)
+// emission is synchronous and NOT durable — dev/test only.
+//
+// At-least-once: the sink and JetStream dedupe on event_id, so a re-published
+// event is harmless. The one loss window is a crash between Dequeue (which
+// removes the spool file) and a successful publish — narrowed by re-enqueue on
+// cancellation; closing it fully would need a delete-after-ack Outbox contract.
 //
 // # Lean / reference-only
 //
