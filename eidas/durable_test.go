@@ -191,8 +191,8 @@ func TestEmit_EnqueueFullFallsBackToSyncPublish(t *testing.T) {
 		qt.Check(t, qt.IsNil(em.SignatureApplied(ctx, eidas.Signature{EnvelopeID: "env-2"}))) // outbox full → sync publish
 	})
 
-	qt.Check(t, qt.Equals(ob.Len(), 1))    // first still buffered
-	qt.Check(t, qt.Equals(tr.count(), 1))  // second published synchronously
+	qt.Check(t, qt.Equals(ob.Len(), 1))   // first still buffered
+	qt.Check(t, qt.Equals(tr.count(), 1)) // second published synchronously
 }
 
 // TestEmit_EnqueueFullAndPublishFailsDrops proves the last-resort: when both the
@@ -215,8 +215,8 @@ func TestEmit_EnqueueFullAndPublishFailsDrops(t *testing.T) {
 		emitErr = em.SignatureApplied(ctx, eidas.Signature{EnvelopeID: "env-2"})
 	})
 
-	qt.Check(t, qt.IsNotNil(emitErr))     // surfaced as non-fatal error to the caller
-	qt.Check(t, qt.Equals(len(dead), 1))  // dead-lettered, not silently lost
+	qt.Check(t, qt.IsNotNil(emitErr))    // surfaced as non-fatal error to the caller
+	qt.Check(t, qt.Equals(len(dead), 1)) // dead-lettered, not silently lost
 }
 
 func TestDrainCloseFlush_NoOpWithoutOutbox(t *testing.T) {
