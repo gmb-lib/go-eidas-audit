@@ -5,7 +5,7 @@ go 1.26.6
 require (
 	azugo.io/azugo v0.38.0
 	azugo.io/core v0.38.0
-	github.com/gmb-lib/go-platform-kit v1.10.0
+	github.com/gmb-lib/go-platform-kit v1.11.1
 	github.com/go-quicktest/qt v1.102.0
 	github.com/spf13/viper v1.21.0
 	github.com/valyala/fasthttp v1.73.0
