@@ -28,6 +28,9 @@ the signing topic. Async is fine here — **integrity, not latency**, is the pri
 go get github.com/gmb-lib/go-eidas-audit
 ```
 
+See [`CHANGELOG.md`](./CHANGELOG.md) for what each release changed, and what it means for code that
+already uses this library, before you bump.
+
 Pinned in lockstep to `github.com/gmb-lib/go-platform-kit` (which pins the `azugo.io/*` line; see `go.mod` for the current version).
 
 ## Usage
