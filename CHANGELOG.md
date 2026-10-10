@@ -4,6 +4,40 @@ Notable changes to this library, newest first. Versions are git tags; this file 
 for whoever bumps the dependency — what changed, and what it means for code that already
 uses it.
 
+## v1.2.6
+
+A security and dependency release with two things to act on: **this library now needs Go 1.27.2**,
+and it **requires azugo v0.40.0 and go-platform-kit v1.11.4**, which your service inherits when it
+takes this version. No source changed here and nothing it does behaves differently.
+
+### Changed
+
+- **The module declares `go 1.27.2`** (was `1.27.0`). Go 1.27.2 and `golang.org/x/net` v0.61.0 fix
+  vulnerabilities that this library's code reaches under the old set. `govulncheck` found six it
+  calls before the move and none after it: GO-2026-6603, -6608, -6611, -6612, -6613 and -6617, in
+  `net/http`, `net/textproto`, `mime/multipart` and `golang.org/x/net`. Raise your own module's `go`
+  directive to `1.27.2`; from there the go command downloads and uses that toolchain by itself. CI
+  that reads `go-version-file: go.mod` follows with no workflow edit.
+
+- **`azugo.io/azugo` and `azugo.io/core` → v0.40.0** (were v0.38.1), with **`go-platform-kit` →
+  v1.11.4**. Nothing in this library's API changed with them. What azugo v0.40.0 changes for a
+  service (outbound calls stop at the request deadline, cookies found by their bare name, `303`
+  after a non-GET redirect, a wider cache interface, one more cache at start) is listed in the
+  `go-platform-kit` v1.11.4 notes.
+
+### Notes
+
+- **Also moved:** `fasthttp` → **v1.75.0**, `golang.org/x/net` → **v0.61.0**, and the indirect
+  modules that came with the platform kit, OpenTelemetry → v1.47.0 and gRPC → v1.84.0 among them.
+
+- **CI's linter moved to golangci-lint v2.14.0** (was v2.13.1). The earlier release cannot read Go
+  1.27.2's compiled standard library and stops before linting anything. CI's pinned GitHub Actions
+  also moved to their current commits. No code changed with either.
+
+- The gate is green on Go 1.27.2: `go mod verify`, `go mod tidy -diff`, build, vet, `gofmt`,
+  golangci-lint v2.14.0, `go test -race` with **0 races**; `govulncheck` reports nothing this library
+  calls.
+
 ## v1.2.5
 
 Dependency maintenance with one thing to act on: **this library now needs Go 1.27**. No source
